@@ -13,7 +13,7 @@ At present, network attacks are rampant in the Internet world, and the attack me
 
 All samples are divided into three categories:
 - **malicious_pure**: The samples are malicious.
-- **powershell_begin_dataset**: The samples in it are benign.
+- **powershell_benign_dataset**: The samples in it are benign.
 
 - **mixed_malicious**: All samples are malicious, and each sample is composed of a malicious sample and a random benign sample.
 
