@@ -1,0 +1,152 @@
+class SlackConnection : Connection {
+
+    [System.Net.WebSockets.ClientWebSocket]$WebSocket
+    [pscustomobject]$LoginData
+    [string]$UserName
+    [string]$Domain
+    [string]$WebSocketUrl
+    [bool]$Connected
+    [object]$ReceiveJob = $null
+
+    SlackConnection() {
+        $this.WebSocket = New-Object System.Net.WebSockets.ClientWebSocket
+        $this.WebSocket.Options.KeepAliveInterval = 5
+    }
+
+    
+    [void]Connect() {
+        if ($null -eq $this.ReceiveJob -or $this.ReceiveJob.State -ne 'Running') {
+            $this.LogDebug('Connecting to Slack Real Time API')
+            $this.RtmConnect()
+            $this.StartReceiveJob()
+        } else {
+            $this.LogDebug([LogSeverity]::Warning, 'Receive job is already running')
+        }
+    }
+
+    
+    [void]RtmConnect() {
+        $token = $this.Config.Credential.GetNetworkCredential().Password
+        $url = "https://slack.com/api/rtm.start?token=$($token)&pretty=1"
+        try {
+            $r = Invoke-RestMethod -Uri $url -Method Get -Verbose:$false
+            $this.LoginData = $r
+            if ($r.ok) {
+                $this.LogInfo('Successfully authenticated to Slack Real Time API')
+                $this.WebSocketUrl = $r.url
+                $this.Domain = $r.team.domain
+                $this.UserName = $r.self.name
+            } else {
+                throw $r
+            }
+        } catch {
+            $this.LogInfo([LogSeverity]::Error, 'Error connecting to Slack Real Time API', [ExceptionFormatter]::Summarize($_))
+        }
+    }
+
+    
+    [void]StartReceiveJob() {
+        $recv = {
+            [cmdletbinding()]
+            param(
+                [parameter(mandatory)]
+                $url
+            )
+
+            
+            Write-Verbose "[SlackBackend:ReceiveJob] Connecting to websocket at [$($url)]"
+            [System.Net.WebSockets.ClientWebSocket]$webSocket = New-Object System.Net.WebSockets.ClientWebSocket
+            $cts = New-Object System.Threading.CancellationTokenSource
+            $task = $webSocket.ConnectAsync($url, $cts.Token)
+            do { Start-Sleep -Milliseconds 100 }
+            until ($task.IsCompleted)
+
+            
+            $buffer = [System.Net.WebSockets.WebSocket]::CreateClientBuffer(1024,1024)
+            $ct = New-Object System.Threading.CancellationToken
+            $taskResult = $null
+            while ($webSocket.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
+                $jsonResult = ""
+                do {
+                    $taskResult = $webSocket.ReceiveAsync($buffer, $ct)
+                    while (-not $taskResult.IsCompleted) {
+                        Start-Sleep -Milliseconds 100
+                    }
+                    $jsonResult += [System.Text.Encoding]::UTF8.GetString($buffer, 0, $taskResult.Result.Count)
+                } until (
+                    $taskResult.Result.EndOfMessage
+                )
+
+                if (-not [string]::IsNullOrEmpty($jsonResult)) {
+                    $jsonResult
+                }
+            }
+            $socketStatus = [pscustomobject]@{
+                State = $webSocket.State
+                CloseStatus = $webSocket.CloseStatus
+                CloseStatusDescription = $webSocket.CloseStatusDescription
+            }
+            $socketStatusStr = ($socketStatus | Format-List | Out-String).Trim()
+            Write-Warning -Message "Websocket state is [$($webSocket.State.ToString())].`n$socketStatusStr"
+        }
+
+        try {
+            $this.ReceiveJob = Start-Job -Name ReceiveRtmMessages -ScriptBlock $recv -ArgumentList $this.WebSocketUrl -ErrorAction Stop -Verbose
+            $this.Connected = $true
+            $this.Status = [ConnectionStatus]::Connected
+            $this.LogInfo("Started websocket receive job [$($this.ReceiveJob.Id)]")
+        } catch {
+            $this.LogInfo([LogSeverity]::Error, "$($_.Exception.Message)", [ExceptionFormatter]::Summarize($_))
+        }
+    }
+
+    
+    [string[]]ReadReceiveJob() {
+        
+        $infoStream = $this.ReceiveJob.ChildJobs[0].Information.ReadAll()
+        $warningStream = $this.ReceiveJob.ChildJobs[0].Warning.ReadAll()
+        $errStream = $this.ReceiveJob.ChildJobs[0].Error.ReadAll()
+        $verboseStream = $this.ReceiveJob.ChildJobs[0].Verbose.ReadAll()
+        $debugStream = $this.ReceiveJob.ChildJobs[0].Debug.ReadAll()
+        foreach ($item in $infoStream) {
+            $this.LogInfo($item.ToString())
+        }
+        foreach ($item in $warningStream) {
+            $this.LogInfo([LogSeverity]::Warning, $item.ToString())
+        }
+        foreach ($item in $errStream) {
+            $this.LogInfo([LogSeverity]::Error, $item.ToString())
+        }
+        foreach ($item in $verboseStream) {
+            $this.LogVerbose($item.ToString())
+        }
+        foreach ($item in $debugStream) {
+            $this.LogVerbose($item.ToString())
+        }
+
+        
+        if ($this.ReceiveJob.State -ne 'Running') {
+            $this.LogInfo([LogSeverity]::Warning, "Receive job state is [$($this.ReceiveJob.State)]. Attempting to reconnect...")
+            Start-Sleep -Seconds 5
+            $this.Connect()
+        }
+
+        if ($this.ReceiveJob.HasMoreData) {
+            [string[]]$jobResult = $this.ReceiveJob.ChildJobs[0].Output.ReadAll()
+            return $jobResult
+        } else {
+            return $null
+        }
+    }
+
+    
+    [void]Disconnect() {
+        $this.LogInfo('Closing websocket')
+        if ($this.ReceiveJob) {
+            $this.LogInfo("Stopping receive job [$($this.ReceiveJob.Id)]")
+            $this.ReceiveJob | Stop-Job -Confirm:$false -PassThru | Remove-Job -Force -ErrorAction SilentlyContinue
+        }
+        $this.Connected = $false
+        $this.Status = [ConnectionStatus]::Disconnected
+    }
+}
